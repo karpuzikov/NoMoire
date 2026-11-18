@@ -1,8 +1,9 @@
 """NoMoire: standalone halftone/moire remover. Drag & drop images or folders onto the window.
 
-Install:  pip install numpy scipy Pillow PySide6
+Install:  pip install numpy scipy Pillow PySide6 opencv-python-headless
 Run:      double-click NoMoire.pyw
 """
+import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 from scipy import fft as scipyFft
@@ -29,16 +30,20 @@ NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL = 0.005
 NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY = 0.08
 NOTCH_RADIUS_IN_SIGMAS = 4
 NOTCHED_LOWPASS_FRACTION = 0.6
-BLURRED_LOWPASS_FRACTION = 0.2
-EDGE_GRADIENT_LOW = 6.0
-EDGE_GRADIENT_HIGH = 25.0
-EDGE_SPREAD_SIGMA = 24.0
+BACKGROUND_LOWPASS_FRACTION = 0.2
+STROKE_ORIENTATION_COUNT = 8
+STROKE_LINE_LENGTH = 15  # longer than the halftone dot pitch, shorter than any text stroke
+STROKE_MINIMUM_EXCESS = 12.0
+STROKE_SPUR_SIZE = 3
+STROKE_TIP_RECOVERY_STEPS = 1
+STROKE_MASK_THRESHOLD = 6.0
+STROKE_MASK_GROW = 7
+STROKE_SMOOTHING_SIGMA = 0.7
+STROKE_SPREAD_SIGMA = 40.0
 FLAT_WINDOW_SIGMA = 3.0
 FLAT_DEVIATION_LOW = 2.0
 FLAT_DEVIATION_HIGH = 5.0
-EDGE_SHARPEN_RADIUS = 3.0
 BLEND_STRIP_HEIGHT = 512
-EDGE_SHARPEN_PERCENT = 120
 REFLECT_PADDING_PIXELS = 64  # avoids FFT wrap-around artifacts at image borders
 
 
@@ -117,49 +122,98 @@ def buildLowpassGain(height, width, fundamentalFrequency, sigmaFraction):
     return np.outer(rowGain, columnGain).astype(np.float32)
 
 
-def buildEdgeAndFlatMasks(grayImage):
-    """Edge mask: 1 near strong edges (notching rings there). Flat mask: 1 in featureless areas (any faint
-    residual lattice shows there). Both computed at quarter resolution."""
-    small = np.asarray(grayImage.reduce(4), dtype=np.float32)
-    gradientMagnitude = np.hypot(gaussian_filter(small, 1.0, order=(0, 1)), gaussian_filter(small, 1.0, order=(1, 0)))
-    edgeStrength = np.clip((gradientMagnitude - EDGE_GRADIENT_LOW) / (EDGE_GRADIENT_HIGH - EDGE_GRADIENT_LOW), 0, 1)
-    edgeMask = np.clip(gaussian_filter(edgeStrength, EDGE_SPREAD_SIGMA / 4) * 3, 0, 1)
+def buildLineKernels():
+    kernels = []
+    for angleDegrees in np.arange(STROKE_ORIENTATION_COUNT) * (180 / STROKE_ORIENTATION_COUNT):
+        kernel = np.zeros((STROKE_LINE_LENGTH, STROKE_LINE_LENGTH), np.uint8)
+        center = STROKE_LINE_LENGTH // 2
+        offsetX, offsetY = np.cos(np.deg2rad(angleDegrees)) * center, np.sin(np.deg2rad(angleDegrees)) * center
+        cv2.line(kernel, (int(round(center - offsetX)), int(round(center - offsetY))),
+                 (int(round(center + offsetX)), int(round(center + offsetY))), 1, 1)
+        kernels.append(kernel)
+    return kernels
+
+
+def extractBrightStrokes(channel, background, lineKernels):
+    """Bright thin lines (text, foil lines) = what survives opening by a line longer than the dot pitch.
+    Halftone paper gaps are too short to survive; thin spurs are removed by a small round opening."""
+    brightExcess = np.maximum(channel - background, 0)
+    strokes = np.zeros_like(brightExcess)
+    for kernel in lineKernels:
+        strokes = np.maximum(strokes, cv2.morphologyEx(brightExcess, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_REFLECT))
+    strokes = np.maximum(strokes - STROKE_MINIMUM_EXCESS, 0)
+    roundKernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (STROKE_SPUR_SIZE, STROKE_SPUR_SIZE))
+    cleaned = cv2.morphologyEx(strokes, cv2.MORPH_OPEN, roundKernel, borderType=cv2.BORDER_REFLECT)
+    for _ in range(STROKE_TIP_RECOVERY_STEPS):  # grow back stroke tips and corners the round opening ate
+        cleaned = np.minimum(cv2.dilate(cleaned, np.ones((3, 3), np.uint8)), strokes)
+    return cleaned
+
+
+def lowpassChannel(channel, gain, padding):
+    spectrum = np.fft.fftshift(scipyFft.fft2(np.pad(channel, padding, mode="reflect"), workers=-1))
+    filtered = scipyFft.ifft2(np.fft.ifftshift(spectrum * gain), workers=-1).real
+    return filtered[padding:filtered.shape[0] - padding, padding:filtered.shape[1] - padding].astype(np.float32)
+
+
+def buildStrokeAndFlatWeights(strokeFraction, trueColorGray):
+    """Weight 1 where the stroke-separated result should replace the notched one: near strokes
+    (notching rings there) and in featureless areas (faint lattice shows there). Quarter resolution."""
+    nearStroke = np.clip(gaussian_filter(strokeFraction, STROKE_SPREAD_SIGMA / 4) * 3, 0, 1)
+    small = np.asarray(trueColorGray.reduce(4), dtype=np.float32)
     localMean = gaussian_filter(small, FLAT_WINDOW_SIGMA)
     localDeviation = np.sqrt(np.maximum(gaussian_filter(small * small, FLAT_WINDOW_SIGMA) - localMean ** 2, 0))
-    flatMask = np.clip((FLAT_DEVIATION_HIGH - localDeviation) / (FLAT_DEVIATION_HIGH - FLAT_DEVIATION_LOW), 0, 1)
-    upsample = lambda mask: np.asarray(Image.fromarray(mask.astype(np.float32)).resize(grayImage.size, Image.BILINEAR))[..., None]
-    return upsample(edgeMask), upsample(flatMask)
+    flat = np.clip((FLAT_DEVIATION_HIGH - localDeviation) / (FLAT_DEVIATION_HIGH - FLAT_DEVIATION_LOW), 0, 1)
+    weight = np.maximum(nearStroke, flat)
+    return np.asarray(Image.fromarray(weight.astype(np.float32)).resize(trueColorGray.size, Image.BILINEAR))[..., None]
 
 
 def descreenWithPeaks(image, screenPeaks, sharpenAmount):
-    """Notch-filtered result by default; plain blur in featureless areas (faint lattice shows there) and
-    blur + sharpen near strong edges (notching rings there). Memory-lean: uint8 intermediates, blend in strips."""
+    """Two results blended: notch-filtered (keeps photo detail) and stroke-separated (smooth background plus
+    crisp thin lines rebuilt on top). Memory-lean: uint8 intermediates, blend in strips."""
     rgbImage = image.convert("RGB")
     if not screenPeaks.peaks:
         return rgbImage
+    cv2.setNumThreads(0)
     width, height = rgbImage.size
     padding = min(REFLECT_PADDING_PIXELS, height - 1, width - 1)
-    notched = np.empty((height, width, 3), np.uint8)
-    blurred = np.empty((height, width, 3), np.uint8)
     paddedHeight, paddedWidth = height + 2 * padding, width + 2 * padding
     notchedGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, NOTCHED_LOWPASS_FRACTION)
-    blurredGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, BLURRED_LOWPASS_FRACTION)
-    toUint8Crop = lambda channel: np.clip(channel[padding:paddedHeight - padding, padding:paddedWidth - padding], 0, 255).astype(np.uint8)
+    backgroundGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, BACKGROUND_LOWPASS_FRACTION)
+    lineKernels = buildLineKernels()
+    rgbArray = np.asarray(rgbImage, dtype=np.float32)
+    notched = np.empty((height, width, 3), np.uint8)
+    stroked = np.empty((height, width, 3), np.uint8)
+    toUint8 = lambda channel: np.clip(channel, 0, 255).astype(np.uint8)
+    # first pass: rough background and strokes per channel; a shared mask keeps strokes out of the background estimate
+    roughBackgrounds, strokeMask = [], np.zeros((height, width), np.float32)
     for channelIndex in range(3):
-        channel = np.pad(np.asarray(rgbImage, dtype=np.float32)[:, :, channelIndex], padding, mode="reflect")
-        spectrum = np.fft.fftshift(scipyFft.fft2(channel, workers=-1))
-        blurred[:, :, channelIndex] = toUint8Crop(scipyFft.ifft2(np.fft.ifftshift(spectrum * blurredGain), workers=-1).real)
-        applyNotches(spectrum, screenPeaks.peaks)
-        notched[:, :, channelIndex] = toUint8Crop(scipyFft.ifft2(np.fft.ifftshift(spectrum * notchedGain), workers=-1).real)
-        del channel, spectrum
-    blurredImage = Image.fromarray(blurred)
-    blurredSharp = np.asarray(blurredImage.filter(ImageFilter.UnsharpMask(radius=EDGE_SHARPEN_RADIUS, percent=EDGE_SHARPEN_PERCENT, threshold=0)))
-    edgeMask, flatMask = buildEdgeAndFlatMasks(blurredImage.convert("L"))
+        channel = rgbArray[:, :, channelIndex]
+        roughBackground = lowpassChannel(channel, backgroundGain, padding)
+        roughBackgrounds.append(roughBackground)
+        strokeMask = np.maximum(strokeMask, extractBrightStrokes(channel, roughBackground, lineKernels))
+    excludedFromBackground = cv2.dilate((strokeMask > STROKE_MASK_THRESHOLD).astype(np.float32),
+                                        np.ones((STROKE_MASK_GROW, STROKE_MASK_GROW), np.uint8))
+    keptWeight = lowpassChannel(1 - excludedFromBackground, backgroundGain, padding)
+    quarterSize = ((width + 3) // 4, (height + 3) // 4)
+    strokeFraction = np.zeros(quarterSize[::-1], np.float32)
+    for channelIndex in range(3):
+        channel = rgbArray[:, :, channelIndex]
+        background = np.where(keptWeight > 0.05,
+                              lowpassChannel(channel * (1 - excludedFromBackground), backgroundGain, padding) / np.maximum(keptWeight, 0.05),
+                              roughBackgrounds[channelIndex])
+        strokes = extractBrightStrokes(channel, background, lineKernels)
+        stroked[:, :, channelIndex] = toUint8(background + cv2.GaussianBlur(strokes, (0, 0), STROKE_SMOOTHING_SIGMA))
+        strokeFraction = np.maximum(strokeFraction, cv2.resize((strokes > STROKE_MASK_THRESHOLD).astype(np.float32),
+                                                               quarterSize, interpolation=cv2.INTER_AREA))
+        paddedSpectrum = np.fft.fftshift(scipyFft.fft2(np.pad(channel, padding, mode="reflect"), workers=-1))
+        applyNotches(paddedSpectrum, screenPeaks.peaks)
+        notchedChannel = scipyFft.ifft2(np.fft.ifftshift(paddedSpectrum * notchedGain), workers=-1).real
+        notched[:, :, channelIndex] = toUint8(notchedChannel[padding:paddedHeight - padding, padding:paddedWidth - padding])
+        del paddedSpectrum, notchedChannel
+    strokeWeight = buildStrokeAndFlatWeights(strokeFraction, Image.fromarray(stroked).convert("L"))
     for top in range(0, height, BLEND_STRIP_HEIGHT):
         rows = slice(top, min(top + BLEND_STRIP_HEIGHT, height))
-        edge, flat = edgeMask[rows], flatMask[rows]
-        notched[rows] = (notched[rows] * ((1 - edge) * (1 - flat)) + blurred[rows] * ((1 - edge) * flat)
-                         + blurredSharp[rows] * edge).astype(np.uint8)
+        notched[rows] = (notched[rows] * (1 - strokeWeight[rows]) + stroked[rows] * strokeWeight[rows]).astype(np.uint8)
     result = Image.fromarray(notched)
     if sharpenAmount > 0:
         result = result.filter(ImageFilter.UnsharpMask(radius=1.5, percent=int(sharpenAmount * 300), threshold=1))
@@ -279,7 +333,7 @@ class DescreenerWindow(QMainWindow):
         self.fileList.setAcceptDrops(False)
         self.fileList.currentRowChanged.connect(self.onFileSelected)
         self.strengthSlider = self.buildSlider(1, 10, 5)
-        self.sharpenSlider = self.buildSlider(0, 100, 30)
+        self.sharpenSlider = self.buildSlider(0, 100, 20)
         self.openButton = QPushButton("Open images")
         self.openButton.clicked.connect(self.openImages)
         self.compareButton = QPushButton("Hold to see original")
