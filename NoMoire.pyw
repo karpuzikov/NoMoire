@@ -1,13 +1,16 @@
 """NoMoire: standalone halftone/moire remover. Drag & drop images or folders onto the window.
 
-Install:  pip install numpy scipy Pillow PySide6 opencv-python-headless
+Method (after Sattva Descreen): find each print screen (cyan/magenta/yellow/black angle and frequency) in the
+spectrum, then cut cosine-tapered disks out of the spectrum at the screen's lattice harmonics and at the beats
+between screens. Everything else in the picture is left untouched.
+
+Install:  pip install numpy scipy Pillow PySide6
 Run:      double-click NoMoire.pyw
 """
-import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 from scipy import fft as scipyFft
-from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
+from scipy.ndimage import gaussian_filter, maximum_filter
 import sys
 from pathlib import Path
 
@@ -17,212 +20,168 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsPixmapItem, Q
                                QHBoxLayout, QLabel, QListWidget, QMainWindow, QPushButton, QSlider, QVBoxLayout,
                                QWidget)
 
+Image.MAX_IMAGE_PIXELS = None
 
-SPECTRUM_TILE_SIZE = 512
-SPECTRUM_TILE_GRID = 3
-MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL = 0.04
-MAXIMUM_PEAKS = 200
-BEAT_PEAK_PROMINENCE = 3.0
-FUNDAMENTAL_PEAK_COUNT = 8
-BACKGROUND_FILTER_SIZE = 21
-MINIMUM_PEAK_PROMINENCE_BASE = 8.0  # natural-log power above local background; strength 5 -> 5.5
-NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL = 0.005
-NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY = 0.08
-NOTCH_RADIUS_IN_SIGMAS = 4
-NOTCHED_LOWPASS_FRACTION = 0.6
-BACKGROUND_LOWPASS_FRACTION = 0.2
-STROKE_ORIENTATION_COUNT = 8
-STROKE_LINE_LENGTH = 15  # longer than the halftone dot pitch, shorter than any text stroke
-STROKE_MINIMUM_EXCESS = 12.0
-STROKE_SPUR_SIZE = 3
-STROKE_TIP_RECOVERY_STEPS = 1
-STROKE_MASK_THRESHOLD = 6.0
-STROKE_MASK_GROW = 7
-STROKE_SMOOTHING_SIGMA = 0.7
-STROKE_SPREAD_SIGMA = 40.0
-FLAT_WINDOW_SIGMA = 3.0
-FLAT_DEVIATION_LOW = 2.0
-FLAT_DEVIATION_HIGH = 5.0
-BLEND_STRIP_HEIGHT = 512
-REFLECT_PADDING_PIXELS = 64  # avoids FFT wrap-around artifacts at image borders
+# Harmonics (m, n) of a square screen lattice: peak = fundamental * (m + i n). Same table Sattva Descreen uses.
+SCREEN_HARMONICS = [(1, 0), (0, 1), (1, 1), (1, -1), (2, 0), (0, 2), (1, 2), (2, 1), (1, -2), (2, -1), (2, 2), (2, -2)]
+DETECTION_TILE_SIZE = 512
+DETECTION_TILE_GRID = 3
+MAXIMUM_SCREENS = 4  # cyan, magenta, yellow, black
+MINIMUM_SCREEN_FREQUENCY_CYCLES_PER_PIXEL = 0.05
+MINIMUM_SCREEN_SCORE = 10.0
+FILTER_TILE_SIZE = 1024  # 50% overlapped Hann tiles
+SCREEN_DISK_RADIUS_BASE = 0.3  # fraction of screen frequency; strength 5 -> 0.55
+SCREEN_DISK_RADIUS_PER_STRENGTH = 0.05
+BEAT_DISK_RADIUS_PER_STRENGTH = 0.024  # strength 5 -> 0.12
+BEAT_MAXIMUM_ORDER = 2
+BEAT_MINIMUM_FREQUENCY = 0.03
+SHARPEN_RADIUS_PIXELS = 1.5
 
 
-class ScreenPeaks:
-    """Detected halftone screen: peak frequencies in cycles per pixel and the lowest screen frequency."""
-
-    def __init__(self, peaks, fundamentalFrequency):
-        self.peaks = peaks
-        self.fundamentalFrequency = fundamentalFrequency
-
-
-def averageSpectrumPowerOverTiles(rgbArray):
-    height, width, _ = rgbArray.shape
-    tileHeight, tileWidth = min(height, SPECTRUM_TILE_SIZE), min(width, SPECTRUM_TILE_SIZE)
-    window = np.outer(np.hanning(tileHeight), np.hanning(tileWidth)).astype(np.float32)
-    topOffsets = np.linspace(0, height - tileHeight, SPECTRUM_TILE_GRID).astype(int)
-    leftOffsets = np.linspace(0, width - tileWidth, SPECTRUM_TILE_GRID).astype(int)
-    totalPower = np.zeros((tileHeight, tileWidth), np.float64)
-    tileCount = 0
-    for top in topOffsets:
-        for left in leftOffsets:
-            for channelIndex in range(3):
-                tile = rgbArray[top:top + tileHeight, left:left + tileWidth, channelIndex]
-                totalPower += np.abs(scipyFft.fft2((tile - tile.mean()) * window, workers=-1)) ** 2
-                tileCount += 1
-    return np.fft.fftshift(totalPower / tileCount)
+def averageSpectrumPower(channel):
+    height, width = channel.shape
+    window = np.outer(np.hanning(DETECTION_TILE_SIZE), np.hanning(DETECTION_TILE_SIZE)).astype(np.float32)
+    power = np.zeros((DETECTION_TILE_SIZE,) * 2, np.float64)
+    for gridY in range(DETECTION_TILE_GRID):
+        for gridX in range(DETECTION_TILE_GRID):
+            top = int((height - DETECTION_TILE_SIZE) * (gridY + 0.5) / DETECTION_TILE_GRID)
+            left = int((width - DETECTION_TILE_SIZE) * (gridX + 0.5) / DETECTION_TILE_GRID)
+            tile = channel[top:top + DETECTION_TILE_SIZE, left:left + DETECTION_TILE_SIZE]
+            power += np.abs(scipyFft.fft2((tile - tile.mean()) * window)) ** 2
+    return scipyFft.fftshift(power / DETECTION_TILE_GRID ** 2)
 
 
-def detectScreenPeaks(rgbArray, strength):
-    """strength 1..10: higher accepts weaker peaks. Returns ScreenPeaks (empty peaks if no screen found)."""
-    meanPower = averageSpectrumPowerOverTiles(rgbArray)
-    tileHeight, tileWidth = meanPower.shape
-    logSpectrum = np.log(meanPower + 1e-3)
-    residual = logSpectrum - uniform_filter(logSpectrum, BACKGROUND_FILTER_SIZE)
-    isLocalMaximum = residual == maximum_filter(residual, size=5)
-    hasPeakAbove = lambda threshold: np.nonzero(isLocalMaximum & (residual > threshold))
-    verticalFrequencyOf = lambda rows: (rows - tileHeight // 2) / tileHeight
-    horizontalFrequencyOf = lambda columns: (columns - tileWidth // 2) / tileWidth
-    rows, columns = hasPeakAbove(MINIMUM_PEAK_PROMINENCE_BASE - 0.5 * strength)
-    radii = np.hypot(verticalFrequencyOf(rows), horizontalFrequencyOf(columns))
-    strongestFirst = [i for i in np.argsort(-residual[rows, columns]) if radii[i] > MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL]
-    if not strongestFirst:
-        return ScreenPeaks([], 0.0)
-    fundamentalFrequency = min(radii[i] for i in strongestFirst[:FUNDAMENTAL_PEAK_COUNT])
-    # beats between the screens of different inks sit below the fundamental and are weaker
-    rows, columns = hasPeakAbove(BEAT_PEAK_PROMINENCE)
-    radii = np.hypot(verticalFrequencyOf(rows), horizontalFrequencyOf(columns))
-    keptIndexes = [i for i in np.argsort(-residual[rows, columns])
-                   if radii[i] > MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL][:MAXIMUM_PEAKS]
-    peaks = [(verticalFrequencyOf(rows[i]), horizontalFrequencyOf(columns[i])) for i in keptIndexes]
-    return ScreenPeaks(peaks, fundamentalFrequency)
+def scoreLattice(prominence, fundamentalBins):
+    center = DETECTION_TILE_SIZE // 2
+    score, counted = 0.0, 0
+    for m, n in SCREEN_HARMONICS:
+        x = m * fundamentalBins[0] - n * fundamentalBins[1]
+        y = n * fundamentalBins[0] + m * fundamentalBins[1]
+        if abs(x) >= center - 2 or abs(y) >= center - 2:
+            continue
+        ix, iy = int(round(x)) + center, int(round(y)) + center
+        score += prominence[iy - 2:iy + 3, ix - 2:ix + 3].max()
+        counted += 1
+    return score, counted
 
 
-def applyNotches(spectrum, peaks):
-    """spectrum is fftshifted; attenuates a gaussian patch around every peak in place."""
-    height, width = spectrum.shape
-    for verticalFrequency, horizontalFrequency in peaks:
-        sigma = max(NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL,
-                    NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY * np.hypot(verticalFrequency, horizontalFrequency))
-        sigmaRows, sigmaColumns = sigma * height, sigma * width
-        centerRow = int(round(height // 2 + verticalFrequency * height))
-        centerColumn = int(round(width // 2 + horizontalFrequency * width))
-        top = max(int(centerRow - NOTCH_RADIUS_IN_SIGMAS * sigmaRows), 0)
-        bottom = min(int(centerRow + NOTCH_RADIUS_IN_SIGMAS * sigmaRows) + 1, height)
-        left = max(int(centerColumn - NOTCH_RADIUS_IN_SIGMAS * sigmaColumns), 0)
-        right = min(int(centerColumn + NOTCH_RADIUS_IN_SIGMAS * sigmaColumns) + 1, width)
-        rowOffsets = (np.arange(top, bottom) - centerRow)[:, None] / sigmaRows
-        columnOffsets = (np.arange(left, right) - centerColumn)[None, :] / sigmaColumns
-        spectrum[top:bottom, left:right] *= 1 - np.exp(-0.5 * (rowOffsets ** 2 + columnOffsets ** 2))
+def detectScreens(channel):
+    """Returns [(fx, fy, score)] fundamentals in cycles/pixel, strongest lattice first."""
+    power = averageSpectrumPower(channel)
+    center = DETECTION_TILE_SIZE // 2
+    logPower = np.log(power + 1)
+    prominence = logPower - gaussian_filter(logPower, 12)
+    searchMap = prominence.copy()
+    yy, xx = np.mgrid[-center:center, -center:center]
+    searchMap[np.hypot(xx, yy) < MINIMUM_SCREEN_FREQUENCY_CYCLES_PER_PIXEL * DETECTION_TILE_SIZE] = -1e9
+    screens = []
+    for _ in range(MAXIMUM_SCREENS):
+        isCandidate = (searchMap == maximum_filter(searchMap, size=5)) & (searchMap > 3.0) & (yy >= 0)
+        candidates = np.argwhere(isCandidate)
+        if not len(candidates):
+            break
+        best = None
+        for iy, ix in candidates[np.argsort(-searchMap[isCandidate])[:40]]:
+            neighborhood = power[iy - 1:iy + 2, ix - 1:ix + 2]
+            weights = neighborhood / neighborhood.sum()
+            offsetY, offsetX = np.mgrid[-1:2, -1:2]
+            bins = (ix - center + float((weights * offsetX).sum()), iy - center + float((weights * offsetY).sum()))
+            score, counted = scoreLattice(prominence, bins)
+            if counted >= 2 and (best is None or score > best[0]):
+                best = (score, bins)
+        if best is None or best[0] < MINIMUM_SCREEN_SCORE:
+            break
+        score, (binX, binY) = best
+        screens.append((binX / DETECTION_TILE_SIZE, binY / DETECTION_TILE_SIZE, score))
+        for m, n in SCREEN_HARMONICS:
+            x, y = m * binX - n * binY, n * binX + m * binY
+            for sign in (1, -1):
+                ix, iy = int(round(sign * x)) + center, int(round(sign * y)) + center
+                if 0 <= ix < DETECTION_TILE_SIZE and 0 <= iy < DETECTION_TILE_SIZE:
+                    searchMap[max(iy - 6, 0):iy + 7, max(ix - 6, 0):ix + 7] = -1e9
+    return screens
 
 
-def buildLowpassGain(height, width, fundamentalFrequency, sigmaFraction):
-    sigma = sigmaFraction * fundamentalFrequency
-    rowGain = np.exp(-0.5 * (((np.arange(height) - height // 2) / height) / sigma) ** 2)
-    columnGain = np.exp(-0.5 * (((np.arange(width) - width // 2) / width) / sigma) ** 2)
-    return np.outer(rowGain, columnGain).astype(np.float32)
+def stampCosineDisk(mask, frequencyX, frequencyY, radius, size):
+    """Cosine-tapered disk (1 at the centre, 0 at the rim) at a fractional frequency and its mirror."""
+    for sign in (1, -1):
+        centerX, centerY, radiusBins = sign * frequencyX * size, sign * frequencyY * size, radius * size
+        columns = np.arange(int(np.floor(centerX - radiusBins)), int(np.ceil(centerX + radiusBins)) + 1)
+        for row in range(int(np.floor(centerY - radiusBins)), int(np.ceil(centerY + radiusBins)) + 1):
+            distance = np.hypot(columns - centerX, row - centerY)
+            weight = np.where(distance < radiusBins, np.cos(0.5 * np.pi * distance / radiusBins), 0)
+            mask[row % size, columns % size] = np.maximum(mask[row % size, columns % size], weight)
 
 
-def buildLineKernels():
-    kernels = []
-    for angleDegrees in np.arange(STROKE_ORIENTATION_COUNT) * (180 / STROKE_ORIENTATION_COUNT):
-        kernel = np.zeros((STROKE_LINE_LENGTH, STROKE_LINE_LENGTH), np.uint8)
-        center = STROKE_LINE_LENGTH // 2
-        offsetX, offsetY = np.cos(np.deg2rad(angleDegrees)) * center, np.sin(np.deg2rad(angleDegrees)) * center
-        cv2.line(kernel, (int(round(center - offsetX)), int(round(center - offsetY))),
-                 (int(round(center + offsetX)), int(round(center + offsetY))), 1, 1)
-        kernels.append(kernel)
-    return kernels
+def buildRemovalMask(size, screens, strength):
+    mask = np.zeros((size, size), np.float32)
+    screenRadius = SCREEN_DISK_RADIUS_BASE + SCREEN_DISK_RADIUS_PER_STRENGTH * strength
+    for fundamentalX, fundamentalY, _ in screens:
+        frequency = np.hypot(fundamentalX, fundamentalY)
+        for m, n in SCREEN_HARMONICS:
+            x, y = m * fundamentalX - n * fundamentalY, n * fundamentalX + m * fundamentalY
+            if np.hypot(x, y) < 0.5:
+                stampCosineDisk(mask, x, y, screenRadius * frequency, size)
+    if len(screens) > 1:
+        vectors = []
+        for index, (fundamentalX, fundamentalY, _) in enumerate(screens):
+            vectors += [(index, fundamentalX, fundamentalY), (index, -fundamentalY, fundamentalX)]
+        meanFrequency = np.mean([np.hypot(x, y) for x, y, _ in screens])
+        stamped = set()
+        orders = [o for o in range(-BEAT_MAXIMUM_ORDER, BEAT_MAXIMUM_ORDER + 1) if o]
+        for screenA, ax, ay in vectors:
+            for screenB, bx, by in vectors:
+                if screenA >= screenB:
+                    continue
+                for orderA in orders:
+                    for orderB in orders:
+                        x, y = orderA * ax + orderB * bx, orderA * ay + orderB * by
+                        if not BEAT_MINIMUM_FREQUENCY <= np.hypot(x, y) < 0.5:
+                            continue
+                        key = (round(x * size), round(y * size))
+                        if key in stamped or (-key[0], -key[1]) in stamped:
+                            continue
+                        stamped.add(key)
+                        stampCosineDisk(mask, x, y, BEAT_DISK_RADIUS_PER_STRENGTH * strength * meanFrequency, size)
+    return mask
 
 
-def extractBrightStrokes(channel, background, lineKernels):
-    """Bright thin lines (text, foil lines) = what survives opening by a line longer than the dot pitch.
-    Halftone paper gaps are too short to survive; thin spurs are removed by a small round opening."""
-    brightExcess = np.maximum(channel - background, 0)
-    strokes = np.zeros_like(brightExcess)
-    for kernel in lineKernels:
-        strokes = np.maximum(strokes, cv2.morphologyEx(brightExcess, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_REFLECT))
-    strokes = np.maximum(strokes - STROKE_MINIMUM_EXCESS, 0)
-    roundKernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (STROKE_SPUR_SIZE, STROKE_SPUR_SIZE))
-    cleaned = cv2.morphologyEx(strokes, cv2.MORPH_OPEN, roundKernel, borderType=cv2.BORDER_REFLECT)
-    for _ in range(STROKE_TIP_RECOVERY_STEPS):  # grow back stroke tips and corners the round opening ate
-        cleaned = np.minimum(cv2.dilate(cleaned, np.ones((3, 3), np.uint8)), strokes)
-    return cleaned
+def removeScreensFromChannel(channel, screens, strength):
+    height, width = channel.shape
+    size, hop = FILTER_TILE_SIZE, FILTER_TILE_SIZE // 2
+    mask = buildRemovalMask(size, screens, strength)
+    padded = np.pad(channel.astype(np.float32), ((hop, hop + size), (hop, hop + size)), mode="reflect")
+    hann = np.hanning(size + 1)[:-1].astype(np.float32)
+    window = np.outer(hann, hann)
+    result = np.zeros_like(padded)
+    for top in range(0, height + size, hop):
+        for left in range(0, width + size, hop):
+            tile = padded[top:top + size, left:left + size]
+            if tile.shape != (size, size):
+                continue
+            screenPart = scipyFft.ifft2(scipyFft.fft2(tile - tile.mean()) * mask).real.astype(np.float32)
+            result[top:top + size, left:left + size] += (tile - screenPart) * window
+    return result[hop:hop + height, hop:hop + width]
 
 
-def lowpassChannel(channel, gain, padding):
-    spectrum = np.fft.fftshift(scipyFft.fft2(np.pad(channel, padding, mode="reflect"), workers=-1))
-    filtered = scipyFft.ifft2(np.fft.ifftshift(spectrum * gain), workers=-1).real
-    return filtered[padding:filtered.shape[0] - padding, padding:filtered.shape[1] - padding].astype(np.float32)
+def detectScreensInImage(image):
+    rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
+    return [detectScreens(rgbArray[..., channel]) for channel in range(3)]
 
 
-def buildStrokeAndFlatWeights(strokeFraction, trueColorGray):
-    """Weight 1 where the stroke-separated result should replace the notched one: near strokes
-    (notching rings there) and in featureless areas (faint lattice shows there). Quarter resolution."""
-    nearStroke = np.clip(gaussian_filter(strokeFraction, STROKE_SPREAD_SIGMA / 4) * 3, 0, 1)
-    small = np.asarray(trueColorGray.reduce(4), dtype=np.float32)
-    localMean = gaussian_filter(small, FLAT_WINDOW_SIGMA)
-    localDeviation = np.sqrt(np.maximum(gaussian_filter(small * small, FLAT_WINDOW_SIGMA) - localMean ** 2, 0))
-    flat = np.clip((FLAT_DEVIATION_HIGH - localDeviation) / (FLAT_DEVIATION_HIGH - FLAT_DEVIATION_LOW), 0, 1)
-    weight = np.maximum(nearStroke, flat)
-    return np.asarray(Image.fromarray(weight.astype(np.float32)).resize(trueColorGray.size, Image.BILINEAR))[..., None]
-
-
-def descreenWithPeaks(image, screenPeaks, sharpenAmount):
-    """Two results blended: notch-filtered (keeps photo detail) and stroke-separated (smooth background plus
-    crisp thin lines rebuilt on top). Memory-lean: uint8 intermediates, blend in strips."""
-    rgbImage = image.convert("RGB")
-    if not screenPeaks.peaks:
-        return rgbImage
-    cv2.setNumThreads(0)
-    width, height = rgbImage.size
-    padding = min(REFLECT_PADDING_PIXELS, height - 1, width - 1)
-    paddedHeight, paddedWidth = height + 2 * padding, width + 2 * padding
-    notchedGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, NOTCHED_LOWPASS_FRACTION)
-    backgroundGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, BACKGROUND_LOWPASS_FRACTION)
-    lineKernels = buildLineKernels()
-    rgbArray = np.asarray(rgbImage, dtype=np.float32)
-    notched = np.empty((height, width, 3), np.uint8)
-    stroked = np.empty((height, width, 3), np.uint8)
-    toUint8 = lambda channel: np.clip(channel, 0, 255).astype(np.uint8)
-    # first pass: rough background and strokes per channel; a shared mask keeps strokes out of the background estimate
-    roughBackgrounds, strokeMask = [], np.zeros((height, width), np.float32)
-    for channelIndex in range(3):
-        channel = rgbArray[:, :, channelIndex]
-        roughBackground = lowpassChannel(channel, backgroundGain, padding)
-        roughBackgrounds.append(roughBackground)
-        strokeMask = np.maximum(strokeMask, extractBrightStrokes(channel, roughBackground, lineKernels))
-    excludedFromBackground = cv2.dilate((strokeMask > STROKE_MASK_THRESHOLD).astype(np.float32),
-                                        np.ones((STROKE_MASK_GROW, STROKE_MASK_GROW), np.uint8))
-    keptWeight = lowpassChannel(1 - excludedFromBackground, backgroundGain, padding)
-    quarterSize = ((width + 3) // 4, (height + 3) // 4)
-    strokeFraction = np.zeros(quarterSize[::-1], np.float32)
-    for channelIndex in range(3):
-        channel = rgbArray[:, :, channelIndex]
-        background = np.where(keptWeight > 0.05,
-                              lowpassChannel(channel * (1 - excludedFromBackground), backgroundGain, padding) / np.maximum(keptWeight, 0.05),
-                              roughBackgrounds[channelIndex])
-        strokes = extractBrightStrokes(channel, background, lineKernels)
-        stroked[:, :, channelIndex] = toUint8(background + cv2.GaussianBlur(strokes, (0, 0), STROKE_SMOOTHING_SIGMA))
-        strokeFraction = np.maximum(strokeFraction, cv2.resize((strokes > STROKE_MASK_THRESHOLD).astype(np.float32),
-                                                               quarterSize, interpolation=cv2.INTER_AREA))
-        paddedSpectrum = np.fft.fftshift(scipyFft.fft2(np.pad(channel, padding, mode="reflect"), workers=-1))
-        applyNotches(paddedSpectrum, screenPeaks.peaks)
-        notchedChannel = scipyFft.ifft2(np.fft.ifftshift(paddedSpectrum * notchedGain), workers=-1).real
-        notched[:, :, channelIndex] = toUint8(notchedChannel[padding:paddedHeight - padding, padding:paddedWidth - padding])
-        del paddedSpectrum, notchedChannel
-    strokeWeight = buildStrokeAndFlatWeights(strokeFraction, Image.fromarray(stroked).convert("L"))
-    for top in range(0, height, BLEND_STRIP_HEIGHT):
-        rows = slice(top, min(top + BLEND_STRIP_HEIGHT, height))
-        notched[rows] = (notched[rows] * (1 - strokeWeight[rows]) + stroked[rows] * strokeWeight[rows]).astype(np.uint8)
-    result = Image.fromarray(notched)
+def descreenWithScreens(image, screensPerChannel, strength, sharpenAmount):
+    rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
+    for channel, screens in enumerate(screensPerChannel):
+        if screens:
+            rgbArray[..., channel] = removeScreensFromChannel(rgbArray[..., channel], screens, strength)
+    result = Image.fromarray(np.clip(rgbArray + 0.5, 0, 255).astype(np.uint8))
     if sharpenAmount > 0:
-        result = result.filter(ImageFilter.UnsharpMask(radius=1.5, percent=int(sharpenAmount * 300), threshold=1))
+        result = result.filter(ImageFilter.UnsharpMask(radius=SHARPEN_RADIUS_PIXELS, percent=int(sharpenAmount * 300), threshold=1))
     return result
 
 
 def descreenImage(image, strength, sharpenAmount):
-    rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
-    return descreenWithPeaks(image, detectScreenPeaks(rgbArray, strength), sharpenAmount)
+    return descreenWithScreens(image, detectScreensInImage(image), strength, sharpenAmount)
 
 
 STYLESHEET = """
@@ -247,7 +206,6 @@ SUPPORTED_FILE_FILTER = "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)"
 DEBOUNCE_MILLISECONDS = 600
 ZOOM_STEP = 1.25
 
-Image.MAX_IMAGE_PIXELS = None
 
 
 def convertPilImageToPixmap(image):
@@ -294,9 +252,9 @@ class PreviewWorker(QThread):
 
     def run(self):
         original = Image.open(self.filePath).convert("RGB")
-        screenPeaks = detectScreenPeaks(np.asarray(original, dtype=np.float32), self.strength)
-        self.processed.emit(original, descreenWithPeaks(original, screenPeaks, self.sharpenAmount),
-                            len(screenPeaks.peaks))
+        screens = detectScreensInImage(original)
+        self.processed.emit(original, descreenWithScreens(original, screens, self.strength, self.sharpenAmount),
+                            max(len(channelScreens) for channelScreens in screens))
 
 
 class SaveAllWorker(QThread):
@@ -417,11 +375,11 @@ class DescreenerWindow(QMainWindow):
         self.previewWorker.finished.connect(self.onPreviewWorkerFinished)
         self.previewWorker.start()
 
-    def onPreviewProcessed(self, original, result, peakCount):
+    def onPreviewProcessed(self, original, result, screenCount):
         self.originalPixmap, self.resultPixmap = convertPilImageToPixmap(original), convertPilImageToPixmap(result)
         self.showPixmap(self.resultPixmap)
-        self.statusLabel.setText(f"Screen peaks found: {peakCount}. Wheel zooms, double-click toggles 100%"
-                                 if peakCount else "No halftone screen detected")
+        self.statusLabel.setText(f"Print screens found: {screenCount}. Wheel zooms, double-click toggles 100%"
+                                 if screenCount else "No halftone screen detected")
 
     def onPreviewWorkerFinished(self):
         if self.isPreviewRequestPending:
