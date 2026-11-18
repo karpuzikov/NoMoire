@@ -1,4 +1,4 @@
-"""NoMoire: standalone halftone/moire remover.
+"""NoMoire: standalone halftone/moire remover. Drag & drop images or folders onto the window.
 
 Install:  pip install numpy scipy Pillow PySide6
 Run:      double-click NoMoire.pyw
@@ -16,77 +16,115 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, Q
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
 
-PEAK_DETECTION_TILE_SIZE = 1024
+SPECTRUM_TILE_SIZE = 512
+SPECTRUM_TILE_GRID = 3
 MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL = 0.04
-MAXIMUM_PEAKS_PER_CHANNEL = 64
-NOTCH_SIGMA_CYCLES_PER_PIXEL = 0.004
+MAXIMUM_PEAKS = 200
+BEAT_PEAK_PROMINENCE = 3.0
+FUNDAMENTAL_PEAK_COUNT = 8
+BACKGROUND_FILTER_SIZE = 21
+MINIMUM_PEAK_PROMINENCE_BASE = 8.0  # natural-log power above local background; strength 5 -> 5.5
+NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL = 0.005
+NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY = 0.08
 NOTCH_RADIUS_IN_SIGMAS = 4
-BACKGROUND_FILTER_SIZE = 15
+LOWPASS_SIGMA_FRACTION_OF_FUNDAMENTAL = 0.6
 
 
-def cropCenterTile(channel):
-    height, width = channel.shape
-    tileHeight = min(height, PEAK_DETECTION_TILE_SIZE)
-    tileWidth = min(width, PEAK_DETECTION_TILE_SIZE)
-    top = (height - tileHeight) // 2
-    left = (width - tileWidth) // 2
-    return channel[top:top + tileHeight, left:left + tileWidth]
+class ScreenPeaks:
+    """Detected halftone screen: peak frequencies in cycles per pixel and the lowest screen frequency."""
+
+    def __init__(self, peaks, fundamentalFrequency):
+        self.peaks = peaks
+        self.fundamentalFrequency = fundamentalFrequency
 
 
-def findHalftonePeaks(channel, thresholdInRobustSigmas):
-    """Returns [(verticalFrequency, horizontalFrequency)] in cycles per pixel."""
-    tile = cropCenterTile(channel)
-    tileHeight, tileWidth = tile.shape
+def averageSpectrumPowerOverTiles(rgbArray):
+    height, width, _ = rgbArray.shape
+    tileHeight, tileWidth = min(height, SPECTRUM_TILE_SIZE), min(width, SPECTRUM_TILE_SIZE)
     window = np.outer(np.hanning(tileHeight), np.hanning(tileWidth)).astype(np.float32)
-    windowedTile = (tile - tile.mean()) * window
-    logSpectrum = np.log1p(np.abs(np.fft.fftshift(scipyFft.fft2(windowedTile))))
+    topOffsets = np.linspace(0, height - tileHeight, SPECTRUM_TILE_GRID).astype(int)
+    leftOffsets = np.linspace(0, width - tileWidth, SPECTRUM_TILE_GRID).astype(int)
+    totalPower = np.zeros((tileHeight, tileWidth), np.float64)
+    tileCount = 0
+    for top in topOffsets:
+        for left in leftOffsets:
+            for channelIndex in range(3):
+                tile = rgbArray[top:top + tileHeight, left:left + tileWidth, channelIndex]
+                totalPower += np.abs(scipyFft.fft2((tile - tile.mean()) * window, workers=-1)) ** 2
+                tileCount += 1
+    return np.fft.fftshift(totalPower / tileCount)
+
+
+def detectScreenPeaks(rgbArray, strength):
+    """strength 1..10: higher accepts weaker peaks. Returns ScreenPeaks (empty peaks if no screen found)."""
+    meanPower = averageSpectrumPowerOverTiles(rgbArray)
+    tileHeight, tileWidth = meanPower.shape
+    logSpectrum = np.log(meanPower + 1e-3)
     residual = logSpectrum - uniform_filter(logSpectrum, BACKGROUND_FILTER_SIZE)
-    median = np.median(residual)
-    robustSigma = 1.4826 * np.median(np.abs(residual - median)) + 1e-9
     isLocalMaximum = residual == maximum_filter(residual, size=5)
-    rows, columns = np.nonzero(isLocalMaximum & (residual > median + thresholdInRobustSigmas * robustSigma))
-    verticalFrequencies = (rows - tileHeight // 2) / tileHeight
-    horizontalFrequencies = (columns - tileWidth // 2) / tileWidth
-    isAboveDc = np.hypot(verticalFrequencies, horizontalFrequencies) > MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL
-    strongestFirst = np.argsort(-residual[rows, columns])
-    keptIndexes = [i for i in strongestFirst if isAboveDc[i]][:MAXIMUM_PEAKS_PER_CHANNEL]
-    return [(verticalFrequencies[i], horizontalFrequencies[i]) for i in keptIndexes]
+    hasPeakAbove = lambda threshold: np.nonzero(isLocalMaximum & (residual > threshold))
+    verticalFrequencyOf = lambda rows: (rows - tileHeight // 2) / tileHeight
+    horizontalFrequencyOf = lambda columns: (columns - tileWidth // 2) / tileWidth
+    rows, columns = hasPeakAbove(MINIMUM_PEAK_PROMINENCE_BASE - 0.5 * strength)
+    radii = np.hypot(verticalFrequencyOf(rows), horizontalFrequencyOf(columns))
+    strongestFirst = [i for i in np.argsort(-residual[rows, columns]) if radii[i] > MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL]
+    if not strongestFirst:
+        return ScreenPeaks([], 0.0)
+    fundamentalFrequency = min(radii[i] for i in strongestFirst[:FUNDAMENTAL_PEAK_COUNT])
+    # beats between the screens of different inks sit below the fundamental and are weaker
+    rows, columns = hasPeakAbove(BEAT_PEAK_PROMINENCE)
+    radii = np.hypot(verticalFrequencyOf(rows), horizontalFrequencyOf(columns))
+    keptIndexes = [i for i in np.argsort(-residual[rows, columns])
+                   if radii[i] > MINIMUM_PEAK_FREQUENCY_CYCLES_PER_PIXEL][:MAXIMUM_PEAKS]
+    peaks = [(verticalFrequencyOf(rows[i]), horizontalFrequencyOf(columns[i])) for i in keptIndexes]
+    return ScreenPeaks(peaks, fundamentalFrequency)
 
 
 def applyNotches(spectrum, peaks):
     """spectrum is fftshifted; attenuates a gaussian patch around every peak in place."""
     height, width = spectrum.shape
-    sigmaRows = NOTCH_SIGMA_CYCLES_PER_PIXEL * height
-    sigmaColumns = NOTCH_SIGMA_CYCLES_PER_PIXEL * width
-    radiusRows = int(np.ceil(NOTCH_RADIUS_IN_SIGMAS * sigmaRows))
-    radiusColumns = int(np.ceil(NOTCH_RADIUS_IN_SIGMAS * sigmaColumns))
     for verticalFrequency, horizontalFrequency in peaks:
+        sigma = max(NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL,
+                    NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY * np.hypot(verticalFrequency, horizontalFrequency))
+        sigmaRows, sigmaColumns = sigma * height, sigma * width
         centerRow = int(round(height // 2 + verticalFrequency * height))
         centerColumn = int(round(width // 2 + horizontalFrequency * width))
-        top, bottom = max(centerRow - radiusRows, 0), min(centerRow + radiusRows + 1, height)
-        left, right = max(centerColumn - radiusColumns, 0), min(centerColumn + radiusColumns + 1, width)
+        top = max(int(centerRow - NOTCH_RADIUS_IN_SIGMAS * sigmaRows), 0)
+        bottom = min(int(centerRow + NOTCH_RADIUS_IN_SIGMAS * sigmaRows) + 1, height)
+        left = max(int(centerColumn - NOTCH_RADIUS_IN_SIGMAS * sigmaColumns), 0)
+        right = min(int(centerColumn + NOTCH_RADIUS_IN_SIGMAS * sigmaColumns) + 1, width)
         rowOffsets = (np.arange(top, bottom) - centerRow)[:, None] / sigmaRows
         columnOffsets = (np.arange(left, right) - centerColumn)[None, :] / sigmaColumns
         spectrum[top:bottom, left:right] *= 1 - np.exp(-0.5 * (rowOffsets ** 2 + columnOffsets ** 2))
 
 
-def descreenChannel(channel, thresholdInRobustSigmas):
-    peaks = findHalftonePeaks(channel, thresholdInRobustSigmas)
-    spectrum = np.fft.fftshift(scipyFft.fft2(channel, workers=-1))
-    applyNotches(spectrum, peaks)
-    return scipyFft.ifft2(np.fft.ifftshift(spectrum), workers=-1).real
+def buildLowpassGain(height, width, fundamentalFrequency):
+    sigma = LOWPASS_SIGMA_FRACTION_OF_FUNDAMENTAL * fundamentalFrequency
+    rowGain = np.exp(-0.5 * (((np.arange(height) - height // 2) / height) / sigma) ** 2)
+    columnGain = np.exp(-0.5 * (((np.arange(width) - width // 2) / width) / sigma) ** 2)
+    return np.outer(rowGain, columnGain).astype(np.float32)
 
 
-def descreenImage(image, sensitivity, sharpenAmount):
-    """sensitivity 1..10 (higher removes more); sharpenAmount 0..1 restores edge crispness."""
-    thresholdInRobustSigmas = 12 - sensitivity
+def descreenWithPeaks(image, screenPeaks, sharpenAmount):
     rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
-    filteredChannels = [descreenChannel(rgbArray[:, :, i], thresholdInRobustSigmas) for i in range(3)]
-    filteredArray = np.clip(np.stack(filteredChannels, axis=2), 0, 255).astype(np.uint8)
-    result = Image.fromarray(filteredArray)
+    if not screenPeaks.peaks:
+        return image.convert("RGB")
+    height, width, _ = rgbArray.shape
+    lowpassGain = buildLowpassGain(height, width, screenPeaks.fundamentalFrequency)
+    filteredChannels = []
+    for channelIndex in range(3):
+        spectrum = np.fft.fftshift(scipyFft.fft2(rgbArray[:, :, channelIndex], workers=-1))
+        applyNotches(spectrum, screenPeaks.peaks)
+        filteredChannels.append(scipyFft.ifft2(np.fft.ifftshift(spectrum * lowpassGain), workers=-1).real)
+    result = Image.fromarray(np.clip(np.stack(filteredChannels, axis=2), 0, 255).astype(np.uint8))
     if sharpenAmount > 0:
-        result = result.filter(ImageFilter.UnsharpMask(radius=1.5, percent=int(sharpenAmount * 200), threshold=2))
+        result = result.filter(ImageFilter.UnsharpMask(radius=1.5, percent=int(sharpenAmount * 300), threshold=1))
     return result
+
+
+def descreenImage(image, strength, sharpenAmount):
+    rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
+    return descreenWithPeaks(image, detectScreenPeaks(rgbArray, strength), sharpenAmount)
 
 
 STYLESHEET = """
@@ -106,8 +144,16 @@ QSlider::sub-page:horizontal { background: #b8f23a; border-radius: 2px; }
 QSlider::handle:horizontal { background: #b8f23a; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }
 """
 
+SUPPORTED_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 SUPPORTED_FILE_FILTER = "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)"
 DEBOUNCE_MILLISECONDS = 250
+PREVIEW_CROP_SIZE = 1024
+
+
+def cropCenter(image, size):
+    width, height = min(image.width, size), min(image.height, size)
+    left, top = (image.width - width) // 2, (image.height - height) // 2
+    return image.crop((left, top, left + width, top + height))
 
 
 def convertPilImageToPixmap(image):
@@ -119,13 +165,13 @@ def convertPilImageToPixmap(image):
 class SaveAllWorker(QThread):
     progressed = Signal(int, int)
 
-    def __init__(self, filePaths, sensitivity, sharpenAmount):
+    def __init__(self, filePaths, strength, sharpenAmount):
         super().__init__()
-        self.filePaths, self.sensitivity, self.sharpenAmount = filePaths, sensitivity, sharpenAmount
+        self.filePaths, self.strength, self.sharpenAmount = filePaths, strength, sharpenAmount
 
     def run(self):
         for index, filePath in enumerate(self.filePaths, 1):
-            result = descreenImage(Image.open(filePath), self.sensitivity, self.sharpenAmount)
+            result = descreenImage(Image.open(filePath), self.strength, self.sharpenAmount)
             result.save(filePath.with_name(f"{filePath.stem}_descreened{filePath.suffix}"), quality=95)
             self.progressed.emit(index, len(self.filePaths))
 
@@ -137,12 +183,15 @@ class DescreenerWindow(QMainWindow):
         self.resize(1280, 760)
         self.filePaths = []
         self.saveAllWorker = None
+        self.setAcceptDrops(True)
+        self.cachedPeaksKey = None
         self.debounceTimer = QTimer(singleShot=True, interval=DEBOUNCE_MILLISECONDS)
         self.debounceTimer.timeout.connect(self.refreshPreview)
 
         self.fileList = QListWidget()
+        self.fileList.setAcceptDrops(False)
         self.fileList.currentRowChanged.connect(lambda _: self.debounceTimer.start())
-        self.sensitivitySlider = self.buildSlider(1, 10, 6)
+        self.strengthSlider = self.buildSlider(1, 10, 5)
         self.sharpenSlider = self.buildSlider(0, 100, 30)
         self.openButton = QPushButton("Open images")
         self.openButton.clicked.connect(self.openImages)
@@ -158,7 +207,7 @@ class DescreenerWindow(QMainWindow):
         sidebar.setSpacing(12)
         sidebar.addWidget(self.openButton)
         sidebar.addWidget(self.fileList, 1)
-        for caption, slider in (("Sensitivity", self.sensitivitySlider), ("Edge sharpen", self.sharpenSlider)):
+        for caption, slider in (("Strength", self.strengthSlider), ("Edge sharpen", self.sharpenSlider)):
             sidebar.addWidget(self.buildCaption(caption))
             sidebar.addWidget(slider)
         sidebar.addWidget(self.saveAllButton)
@@ -197,11 +246,24 @@ class DescreenerWindow(QMainWindow):
     def buildCaption(self, text):
         return QLabel(text, objectName="caption")
 
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        droppedPaths = [Path(url.toLocalFile()) for url in event.mimeData().urls()]
+        imagePaths = [p for path in droppedPaths for p in (sorted(path.iterdir()) if path.is_dir() else [path])
+                      if p.suffix.lower() in SUPPORTED_SUFFIXES]
+        if imagePaths:
+            self.loadImages(imagePaths)
+
     def openImages(self):
         selectedPaths, _ = QFileDialog.getOpenFileNames(self, "Open images", "", SUPPORTED_FILE_FILTER)
-        if not selectedPaths:
-            return
-        self.filePaths = [Path(p) for p in selectedPaths]
+        if selectedPaths:
+            self.loadImages([Path(p) for p in selectedPaths])
+
+    def loadImages(self, imagePaths):
+        self.filePaths = imagePaths
         self.fileList.clear()
         self.fileList.addItems([p.name for p in self.filePaths])
         self.saveAllButton.setEnabled(True)
@@ -211,18 +273,21 @@ class DescreenerWindow(QMainWindow):
         row = self.fileList.currentRow()
         if row < 0:
             return
-        fullImage = Image.open(self.filePaths[row]).convert("RGB")
-        left = (fullImage.width - min(fullImage.width, PEAK_DETECTION_TILE_SIZE)) // 2
-        top = (fullImage.height - min(fullImage.height, PEAK_DETECTION_TILE_SIZE)) // 2
-        centerCrop = fullImage.crop((left, top, left + min(fullImage.width, PEAK_DETECTION_TILE_SIZE),
-                                     top + min(fullImage.height, PEAK_DETECTION_TILE_SIZE)))
-        result = descreenImage(centerCrop, self.sensitivitySlider.value(), self.sharpenSlider.value() / 100)
-        for label, image in ((self.beforeLabel, centerCrop), (self.afterLabel, result)):
+        filePath, strength = self.filePaths[row], self.strengthSlider.value()
+        if self.cachedPeaksKey != (filePath, strength):
+            fullImage = Image.open(filePath).convert("RGB")
+            self.cachedPeaks = detectScreenPeaks(np.asarray(fullImage, dtype=np.float32), strength)
+            self.cachedCrop = cropCenter(fullImage, PREVIEW_CROP_SIZE)
+            self.cachedPeaksKey = (filePath, strength)
+        result = descreenWithPeaks(self.cachedCrop, self.cachedPeaks, self.sharpenSlider.value() / 100)
+        self.statusLabel.setText(f"Screen peaks found: {len(self.cachedPeaks.peaks)}" if self.cachedPeaks.peaks
+                                 else "No halftone screen detected")
+        for label, image in ((self.beforeLabel, self.cachedCrop), (self.afterLabel, result)):
             label.setPixmap(convertPilImageToPixmap(image))
 
     def saveAll(self):
         self.saveAllButton.setEnabled(False)
-        self.saveAllWorker = SaveAllWorker(self.filePaths, self.sensitivitySlider.value(), self.sharpenSlider.value() / 100)
+        self.saveAllWorker = SaveAllWorker(self.filePaths, self.strengthSlider.value(), self.sharpenSlider.value() / 100)
         self.saveAllWorker.progressed.connect(lambda done, total: self.statusLabel.setText(f"Saved {done}/{total}"))
         self.saveAllWorker.finished.connect(lambda: self.saveAllButton.setEnabled(True))
         self.saveAllWorker.start()
