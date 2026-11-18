@@ -169,11 +169,59 @@ def detectScreensInImage(image):
     return [detectScreens(rgbArray[..., channel]) for channel in range(3)]
 
 
+NOISE_SLIDER_DEFAULT_PERCENT = 50
+NOISE_BAND_SETTINGS = {  # name: (slider gamma, threshold steepness k) decoded from Sattva Descreen
+    "original": (0.7, None), "edges": (1.0, 2.5), "fine": (0.7, 3.0), "middle": (0.5, 16.0), "large": (0.25, 50.0),
+}
+NOISE_PADDING_PIXELS = 96
+
+
+def noiseRamp(x):
+    return np.where(x > 1, 1.0, np.clip(x * (x * (x * (3.0936120 * x - 8.1681290) + 6.2728438) - 0.1982168), 0, None))
+
+
+def noiseStrengthAndThreshold(bandName):
+    gamma, steepness = NOISE_BAND_SETTINGS[bandName]
+    strength = (NOISE_SLIDER_DEFAULT_PERCENT / 100.0) ** gamma
+    if steepness is None:
+        return strength, 0.0
+    angle = np.pi / 2 - 0.3 / steepness
+    return strength, 255.0 * np.tan((1 - strength) * angle) / np.tan(angle)
+
+
+def reduceNoiseInChannel(channel, screenFrequency):
+    pad = NOISE_PADDING_PIXELS
+    padded = np.pad(channel.astype(np.float32), ((pad, pad), (pad, pad)), mode="reflect")
+    spectrum = scipyFft.rfft2(padded)
+    radius = np.hypot(np.fft.rfftfreq(padded.shape[1])[None, :], np.fft.fftfreq(padded.shape[0])[:, None]).astype(np.float32)
+    ramps = {name: noiseRamp(radius / cutoff) for name, cutoff in
+             (("fine", 2 * screenFrequency / 3), ("middle", screenFrequency / 3), ("large", screenFrequency / 6))}
+    masks = {"fine": ramps["fine"], "middle": ramps["middle"] - ramps["fine"], "large": ramps["large"] - ramps["middle"]}
+    cutoffs = {"fine": 2 * screenFrequency / 3, "middle": screenFrequency / 3, "large": screenFrequency / 6}
+    output = scipyFft.irfft2(spectrum * (1 - ramps["large"]), s=padded.shape)
+    fineMagnitude = None
+    for name, mask in masks.items():
+        band = scipyFft.irfft2(spectrum * mask, s=padded.shape)
+        magnitude = np.sqrt(gaussian_filter(band * band, 1.4 / cutoffs[name] / 2.5))
+        if name == "fine":
+            fineMagnitude = magnitude
+        strength, threshold = noiseStrengthAndThreshold(name)
+        output += band * np.clip(1.2 * (magnitude / threshold - 0.3) / 0.7, 0, 1.2)
+    edgeStrength, edgeThreshold = noiseStrengthAndThreshold("edges")
+    edgeMask = np.clip((fineMagnitude - edgeThreshold) * 5.6 / 255, 0, 1)
+    output = (1 - edgeMask) * output + edgeMask * padded
+    originalBlend, _ = noiseStrengthAndThreshold("original")
+    output = output * (1 - originalBlend) + padded * originalBlend
+    return output[pad:-pad, pad:-pad]
+
+
 def descreenWithScreens(image, screensPerChannel, strength, sharpenAmount):
     rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
     for channel, screens in enumerate(screensPerChannel):
         if screens:
             rgbArray[..., channel] = removeScreensFromChannel(rgbArray[..., channel], screens, strength)
+            meanFrequency = float(np.mean([np.hypot(fx, fy) for fx, fy, _ in screens]))
+            rgbArray[..., channel] = reduceNoiseInChannel(rgbArray[..., channel], meanFrequency)
     result = Image.fromarray(np.clip(rgbArray + 0.5, 0, 255).astype(np.uint8))
     if sharpenAmount > 0:
         result = result.filter(ImageFilter.UnsharpMask(radius=SHARPEN_RADIUS_PIXELS, percent=int(sharpenAmount * 300), threshold=1))
