@@ -6,7 +6,7 @@ Run:      double-click NoMoire.pyw
 import numpy as np
 from PIL import Image, ImageFilter
 from scipy import fft as scipyFft
-from scipy.ndimage import maximum_filter, uniform_filter
+from scipy.ndimage import gaussian_filter, maximum_filter, uniform_filter
 import sys
 from pathlib import Path
 
@@ -28,7 +28,17 @@ MINIMUM_PEAK_PROMINENCE_BASE = 8.0  # natural-log power above local background; 
 NOTCH_MINIMUM_SIGMA_CYCLES_PER_PIXEL = 0.005
 NOTCH_SIGMA_FRACTION_OF_PEAK_FREQUENCY = 0.08
 NOTCH_RADIUS_IN_SIGMAS = 4
-LOWPASS_SIGMA_FRACTION_OF_FUNDAMENTAL = 0.6
+NOTCHED_LOWPASS_FRACTION = 0.6
+BLURRED_LOWPASS_FRACTION = 0.2
+EDGE_GRADIENT_LOW = 6.0
+EDGE_GRADIENT_HIGH = 25.0
+EDGE_SPREAD_SIGMA = 24.0
+FLAT_WINDOW_SIGMA = 3.0
+FLAT_DEVIATION_LOW = 2.0
+FLAT_DEVIATION_HIGH = 5.0
+EDGE_SHARPEN_RADIUS = 3.0
+BLEND_STRIP_HEIGHT = 512
+EDGE_SHARPEN_PERCENT = 120
 REFLECT_PADDING_PIXELS = 64  # avoids FFT wrap-around artifacts at image borders
 
 
@@ -100,28 +110,57 @@ def applyNotches(spectrum, peaks):
         spectrum[top:bottom, left:right] *= 1 - np.exp(-0.5 * (rowOffsets ** 2 + columnOffsets ** 2))
 
 
-def buildLowpassGain(height, width, fundamentalFrequency):
-    sigma = LOWPASS_SIGMA_FRACTION_OF_FUNDAMENTAL * fundamentalFrequency
+def buildLowpassGain(height, width, fundamentalFrequency, sigmaFraction):
+    sigma = sigmaFraction * fundamentalFrequency
     rowGain = np.exp(-0.5 * (((np.arange(height) - height // 2) / height) / sigma) ** 2)
     columnGain = np.exp(-0.5 * (((np.arange(width) - width // 2) / width) / sigma) ** 2)
     return np.outer(rowGain, columnGain).astype(np.float32)
 
 
+def buildEdgeAndFlatMasks(grayImage):
+    """Edge mask: 1 near strong edges (notching rings there). Flat mask: 1 in featureless areas (any faint
+    residual lattice shows there). Both computed at quarter resolution."""
+    small = np.asarray(grayImage.reduce(4), dtype=np.float32)
+    gradientMagnitude = np.hypot(gaussian_filter(small, 1.0, order=(0, 1)), gaussian_filter(small, 1.0, order=(1, 0)))
+    edgeStrength = np.clip((gradientMagnitude - EDGE_GRADIENT_LOW) / (EDGE_GRADIENT_HIGH - EDGE_GRADIENT_LOW), 0, 1)
+    edgeMask = np.clip(gaussian_filter(edgeStrength, EDGE_SPREAD_SIGMA / 4) * 3, 0, 1)
+    localMean = gaussian_filter(small, FLAT_WINDOW_SIGMA)
+    localDeviation = np.sqrt(np.maximum(gaussian_filter(small * small, FLAT_WINDOW_SIGMA) - localMean ** 2, 0))
+    flatMask = np.clip((FLAT_DEVIATION_HIGH - localDeviation) / (FLAT_DEVIATION_HIGH - FLAT_DEVIATION_LOW), 0, 1)
+    upsample = lambda mask: np.asarray(Image.fromarray(mask.astype(np.float32)).resize(grayImage.size, Image.BILINEAR))[..., None]
+    return upsample(edgeMask), upsample(flatMask)
+
+
 def descreenWithPeaks(image, screenPeaks, sharpenAmount):
-    rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
+    """Notch-filtered result by default; plain blur in featureless areas (faint lattice shows there) and
+    blur + sharpen near strong edges (notching rings there). Memory-lean: uint8 intermediates, blend in strips."""
+    rgbImage = image.convert("RGB")
     if not screenPeaks.peaks:
-        return image.convert("RGB")
-    padding = min(REFLECT_PADDING_PIXELS, rgbArray.shape[0] - 1, rgbArray.shape[1] - 1)
-    rgbArray = np.pad(rgbArray, ((padding, padding), (padding, padding), (0, 0)), mode="reflect")
-    height, width, _ = rgbArray.shape
-    lowpassGain = buildLowpassGain(height, width, screenPeaks.fundamentalFrequency)
-    filteredChannels = []
+        return rgbImage
+    width, height = rgbImage.size
+    padding = min(REFLECT_PADDING_PIXELS, height - 1, width - 1)
+    notched = np.empty((height, width, 3), np.uint8)
+    blurred = np.empty((height, width, 3), np.uint8)
+    paddedHeight, paddedWidth = height + 2 * padding, width + 2 * padding
+    notchedGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, NOTCHED_LOWPASS_FRACTION)
+    blurredGain = buildLowpassGain(paddedHeight, paddedWidth, screenPeaks.fundamentalFrequency, BLURRED_LOWPASS_FRACTION)
+    toUint8Crop = lambda channel: np.clip(channel[padding:paddedHeight - padding, padding:paddedWidth - padding], 0, 255).astype(np.uint8)
     for channelIndex in range(3):
-        spectrum = np.fft.fftshift(scipyFft.fft2(rgbArray[:, :, channelIndex], workers=-1))
+        channel = np.pad(np.asarray(rgbImage, dtype=np.float32)[:, :, channelIndex], padding, mode="reflect")
+        spectrum = np.fft.fftshift(scipyFft.fft2(channel, workers=-1))
+        blurred[:, :, channelIndex] = toUint8Crop(scipyFft.ifft2(np.fft.ifftshift(spectrum * blurredGain), workers=-1).real)
         applyNotches(spectrum, screenPeaks.peaks)
-        filteredChannels.append(scipyFft.ifft2(np.fft.ifftshift(spectrum * lowpassGain), workers=-1).real)
-    unpaddedArray = np.stack(filteredChannels, axis=2)[padding:height - padding, padding:width - padding]
-    result = Image.fromarray(np.clip(unpaddedArray, 0, 255).astype(np.uint8))
+        notched[:, :, channelIndex] = toUint8Crop(scipyFft.ifft2(np.fft.ifftshift(spectrum * notchedGain), workers=-1).real)
+        del channel, spectrum
+    blurredImage = Image.fromarray(blurred)
+    blurredSharp = np.asarray(blurredImage.filter(ImageFilter.UnsharpMask(radius=EDGE_SHARPEN_RADIUS, percent=EDGE_SHARPEN_PERCENT, threshold=0)))
+    edgeMask, flatMask = buildEdgeAndFlatMasks(blurredImage.convert("L"))
+    for top in range(0, height, BLEND_STRIP_HEIGHT):
+        rows = slice(top, min(top + BLEND_STRIP_HEIGHT, height))
+        edge, flat = edgeMask[rows], flatMask[rows]
+        notched[rows] = (notched[rows] * ((1 - edge) * (1 - flat)) + blurred[rows] * ((1 - edge) * flat)
+                         + blurredSharp[rows] * edge).astype(np.uint8)
+    result = Image.fromarray(notched)
     if sharpenAmount > 0:
         result = result.filter(ImageFilter.UnsharpMask(radius=1.5, percent=int(sharpenAmount * 300), threshold=1))
     return result
