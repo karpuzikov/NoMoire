@@ -1,8 +1,8 @@
 """NoMoire: standalone halftone/moire remover. Drag & drop images or folders onto the window.
 
-Method (after Sattva Descreen): find each print screen (cyan/magenta/yellow/black angle and frequency) in the
-spectrum, then cut cosine-tapered disks out of the spectrum at the screen's lattice harmonics and at the beats
-between screens. Everything else in the picture is left untouched.
+Method (decoded from Sattva Descreen): find each print screen (cyan/magenta/yellow/black angle and frequency),
+low-pass the picture just under the screen frequency, then fit and subtract the beat (moire) patterns between
+screens with a brightness-level regression. The same filter runs on every pixel.
 
 Install:  pip install numpy scipy Pillow PySide6
 Run:      double-click NoMoire.pyw
@@ -29,12 +29,6 @@ DETECTION_TILE_GRID = 3
 MAXIMUM_SCREENS = 4  # cyan, magenta, yellow, black
 MINIMUM_SCREEN_FREQUENCY_CYCLES_PER_PIXEL = 0.05
 MINIMUM_SCREEN_SCORE = 10.0
-FILTER_TILE_SIZE = 1024  # 50% overlapped Hann tiles
-SCREEN_DISK_RADIUS_BASE = 0.3  # fraction of screen frequency; strength 5 -> 0.55
-SCREEN_DISK_RADIUS_PER_STRENGTH = 0.05
-BEAT_DISK_RADIUS_PER_STRENGTH = 0.024  # strength 5 -> 0.12
-BEAT_MAXIMUM_ORDER = 2
-BEAT_MINIMUM_FREQUENCY = 0.03
 SHARPEN_RADIUS_PIXELS = 1.5
 
 
@@ -102,137 +96,157 @@ def detectScreens(channel):
     return screens
 
 
-def stampCosineDisk(mask, frequencyX, frequencyY, radius, size):
-    """Cosine-tapered disk (1 at the centre, 0 at the rim) at a fractional frequency and its mirror."""
-    for sign in (1, -1):
-        centerX, centerY, radiusBins = sign * frequencyX * size, sign * frequencyY * size, radius * size
-        columns = np.arange(int(np.floor(centerX - radiusBins)), int(np.ceil(centerX + radiusBins)) + 1)
-        for row in range(int(np.floor(centerY - radiusBins)), int(np.ceil(centerY + radiusBins)) + 1):
-            distance = np.hypot(columns - centerX, row - centerY)
-            weight = np.where(distance < radiusBins, np.cos(0.5 * np.pi * distance / radiusBins), 0)
-            mask[row % size, columns % size] = np.maximum(mask[row % size, columns % size], weight)
-
-
-def buildRemovalMask(size, screens, strength):
-    mask = np.zeros((size, size), np.float32)
-    screenRadius = SCREEN_DISK_RADIUS_BASE + SCREEN_DISK_RADIUS_PER_STRENGTH * strength
-    for fundamentalX, fundamentalY, _ in screens:
-        frequency = np.hypot(fundamentalX, fundamentalY)
-        for m, n in SCREEN_HARMONICS:
-            x, y = m * fundamentalX - n * fundamentalY, n * fundamentalX + m * fundamentalY
-            if np.hypot(x, y) < 0.5:
-                stampCosineDisk(mask, x, y, screenRadius * frequency, size)
-    if len(screens) > 1:
-        vectors = []
-        for index, (fundamentalX, fundamentalY, _) in enumerate(screens):
-            vectors += [(index, fundamentalX, fundamentalY), (index, -fundamentalY, fundamentalX)]
-        meanFrequency = np.mean([np.hypot(x, y) for x, y, _ in screens])
-        stamped = set()
-        orders = [o for o in range(-BEAT_MAXIMUM_ORDER, BEAT_MAXIMUM_ORDER + 1) if o]
-        for screenA, ax, ay in vectors:
-            for screenB, bx, by in vectors:
-                if screenA >= screenB:
-                    continue
-                for orderA in orders:
-                    for orderB in orders:
-                        x, y = orderA * ax + orderB * bx, orderA * ay + orderB * by
-                        if not BEAT_MINIMUM_FREQUENCY <= np.hypot(x, y) < 0.5:
-                            continue
-                        key = (round(x * size), round(y * size))
-                        if key in stamped or (-key[0], -key[1]) in stamped:
-                            continue
-                        stamped.add(key)
-                        stampCosineDisk(mask, x, y, BEAT_DISK_RADIUS_PER_STRENGTH * strength * meanFrequency, size)
-    return mask
-
-
-def removeScreensFromChannel(channel, screens, strength):
-    height, width = channel.shape
-    size, hop = FILTER_TILE_SIZE, FILTER_TILE_SIZE // 2
-    mask = buildRemovalMask(size, screens, strength)
-    padded = np.pad(channel.astype(np.float32), ((hop, hop + size), (hop, hop + size)), mode="reflect")
-    hann = np.hanning(size + 1)[:-1].astype(np.float32)
-    window = np.outer(hann, hann)
-    result = np.zeros_like(padded)
-    for top in range(0, height + size, hop):
-        for left in range(0, width + size, hop):
-            tile = padded[top:top + size, left:left + size]
-            if tile.shape != (size, size):
-                continue
-            screenPart = scipyFft.ifft2(scipyFft.fft2(tile - tile.mean()) * mask).real.astype(np.float32)
-            result[top:top + size, left:left + size] += (tile - screenPart) * window
-    return result[hop:hop + height, hop:hop + width]
-
-
 def detectScreensInImage(image):
     rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
     return [detectScreens(rgbArray[..., channel]) for channel in range(3)]
 
 
-NOISE_SLIDER_DEFAULT_PERCENT = 50
-NOISE_BAND_SETTINGS = {  # name: (slider gamma, threshold steepness k) decoded from Sattva Descreen
-    "original": (0.7, None), "edges": (1.0, 2.5), "fine": (0.7, 3.0), "middle": (0.5, 16.0), "large": (0.25, 50.0),
-}
-NOISE_PADDING_PIXELS = 96
+SCREEN_RECORD_NAMES = ("cyan", "magenta", "black", "yellow")
+LATTICE_HARMONICS = [(1, 0), (0, 1), (1, 1), (1, -1)]  # the four Sattva uses in moire mode
+LOWPASS_CUTOFF_OF_SCREEN_FREQUENCY = 0.98  # Sattva table 2d10
+LOWPASS_COSINE_AMPLITUDES = (1.1344, -0.1444, 0.0007, 0.0093)
+BEAT_COSINE_AMPLITUDES = (0.8061, 0.2048, -0.0076, -0.0033)
+EXTRACTION_DISK_RADIUS_OF_SCREEN_FREQUENCY = 0.1367
+DIAGONAL_HARMONIC_AMPLITUDE = 0.922
+BEAT_DISK_RADIUS_OF_SCREEN_FREQUENCY = 0.15
+BRIGHTNESS_LEVEL_COUNT = 50
+MINIMUM_LEVEL_GROUP_PIXEL_FRACTION = 0.10
+REGRESSION_TILE_CORE_PIXELS = 1536
+REGRESSION_TILE_MARGIN_PIXELS = 192
+STRENGTH_TO_CUTOFF_STEP = 0.04  # shortcut: strength 5 = Sattva default; each step moves the cutoff 4 %
 
 
-def noiseRamp(x):
-    return np.where(x > 1, 1.0, np.clip(x * (x * (x * (3.0936120 * x - 8.1681290) + 6.2728438) - 0.1982168), 0, None))
+def radialCosineWindow(normalizedRadius, amplitudes):
+    window = sum(amplitude * np.cos((2 * index + 1) * np.pi / 2 * normalizedRadius) for index, amplitude in enumerate(amplitudes))
+    return np.where(normalizedRadius >= 1, 0.0, window).astype(np.float32)
 
 
-def noiseStrengthAndThreshold(bandName):
-    gamma, steepness = NOISE_BAND_SETTINGS[bandName]
-    strength = (NOISE_SLIDER_DEFAULT_PERCENT / 100.0) ** gamma
-    if steepness is None:
-        return strength, 0.0
-    angle = np.pi / 2 - 0.3 / steepness
-    return strength, 255.0 * np.tan((1 - strength) * angle) / np.tan(angle)
+def classifyScreensIntoRecords(screensPerChannel):
+    """Maps detected fundamentals to cyan/magenta/black/yellow by their angle. Returns {name: (fx, fy)}."""
+    records = {}
+    for screens in screensPerChannel:
+        for fx, fy, _ in screens:
+            angle = np.degrees(np.arctan2(fy, fx)) % 90
+            name = "yellow" if angle < 5 or angle > 85 else "cyan" if angle < 30 else "black" if angle < 60 else "magenta"
+            records.setdefault(name, (fx, fy))
+    return records
 
 
-def totalVariationMap(band):
-    horizontal = np.abs(np.diff(band, axis=1))
-    vertical = np.abs(np.diff(band, axis=0))
-    total = np.zeros_like(band)
-    total[:, :-1] += horizontal
-    total[:, 1:] += horizontal
-    total[:-1, :] += vertical
-    total[1:, :] += vertical
-    return total
+def stampDisks(shape, centres, radius, profile):
+    height, width = shape
+    mask = np.zeros(shape, np.float32)
+    radiusBins = radius * max(height, width)
+    reach = int(np.ceil(radiusBins)) + 1
+    offsetX, offsetY = np.meshgrid(np.arange(-reach, reach + 1), np.arange(-reach, reach + 1))
+    for centreX, centreY in centres:
+        for sign in (1, -1):
+            binX, binY = sign * centreX * width, sign * centreY * height
+            roundedX, roundedY = int(round(binX)), int(round(binY))
+            distance = np.hypot(roundedX + offsetX - binX, roundedY + offsetY - binY)
+            rows, columns = (roundedY + offsetY) % height, (roundedX + offsetX) % width
+            mask[rows, columns] = np.maximum(mask[rows, columns], profile(distance, radiusBins).astype(np.float32))
+    return mask
 
 
-def reduceNoiseInChannel(channel, screenFrequency):
-    pad = NOISE_PADDING_PIXELS
-    padded = np.pad(channel.astype(np.float32), ((pad, pad), (pad, pad)), mode="reflect")
-    spectrum = scipyFft.rfft2(padded)
-    radius = np.hypot(np.fft.rfftfreq(padded.shape[1])[None, :], np.fft.fftfreq(padded.shape[0])[:, None]).astype(np.float32)
-    ramps = {name: noiseRamp(radius / cutoff) for name, cutoff in
-             (("fine", 2 * screenFrequency / 3), ("middle", screenFrequency / 3), ("large", screenFrequency / 6))}
-    masks = {"fine": ramps["fine"], "middle": ramps["middle"] - ramps["fine"], "large": ramps["large"] - ramps["middle"]}
-    cutoffs = {"fine": 2 * screenFrequency / 3, "middle": screenFrequency / 3, "large": screenFrequency / 6}
-    output = scipyFft.irfft2(spectrum * (1 - ramps["large"]), s=padded.shape)
-    fineMagnitude = None
-    for name, mask in masks.items():
-        band = scipyFft.irfft2(spectrum * mask, s=padded.shape)
-        magnitude = gaussian_filter(totalVariationMap(band), 1.4 / cutoffs[name] / 2.5)
-        if name == "fine":
-            fineMagnitude = magnitude
-        strength, threshold = noiseStrengthAndThreshold(name)
-        output += band * np.clip(1.2 * (magnitude / threshold - 0.3) / 0.7, 0, 1.2)
-    edgeStrength, edgeThreshold = noiseStrengthAndThreshold("edges")
-    edgeMask = np.clip((fineMagnitude - edgeThreshold) * 5.6 / 255, 0, 1)
-    output = (1 - edgeMask) * output + edgeMask * padded
-    originalBlend, _ = noiseStrengthAndThreshold("original")
-    output = output * (1 - originalBlend) + padded * originalBlend
-    return output[pad:-pad, pad:-pad]
+def screenHarmonicCentres(fundamental, harmonics):
+    fx, fy = fundamental
+    centres = [(m * fx - n * fy, m * fy + n * fx) for m, n in harmonics]
+    return [(x, y) for x, y in centres if np.hypot(x, y) < 0.5]
+
+
+def descreenTile(tile, records, screenFrequency, cutoffScale):
+    """tile: float32 (h, w, 3), already margin-padded. Returns the descreened tile (same size)."""
+    height, width, _ = tile.shape
+    spectra = [scipyFft.fft2(tile[..., channel]) for channel in range(3)]
+    radius = np.hypot(np.fft.fftfreq(width)[None, :], np.fft.fftfreq(height)[:, None]).astype(np.float32)
+    lowpass = radialCosineWindow(radius / (LOWPASS_CUTOFF_OF_SCREEN_FREQUENCY * cutoffScale * screenFrequency), LOWPASS_COSINE_AMPLITUDES)
+    spectrumOfRecord = {"cyan": spectra[0], "magenta": spectra[1], "black": 0.5 * (spectra[0] + spectra[1]), "yellow": spectra[2]}
+    extractionProfile = lambda distance, radiusBins: np.where(distance < radiusBins + 1, np.cos(np.pi / 2 * distance / (radiusBins + 1)), 0)
+    components = {}
+    for name, fundamental in records.items():
+        spectrum = np.zeros((height, width), np.complex64)
+        for index, harmonic in enumerate(LATTICE_HARMONICS):
+            for centre in screenHarmonicCentres(fundamental, [harmonic]):
+                weight = stampDisks((height, width), [centre], EXTRACTION_DISK_RADIUS_OF_SCREEN_FREQUENCY * screenFrequency, extractionProfile)
+                spectrum += weight * spectrumOfRecord[name] * (1.0 if index < 2 else DIAGONAL_HARMONIC_AMPLITUDE)
+        components[name] = scipyFft.ifft2(spectrum).real.astype(np.float32)
+    predictorPairs = [(a, b) for a, b in (("magenta", "black"), ("cyan", "black"), ("cyan", "magenta"),
+                                          ("cyan", "yellow"), ("magenta", "yellow"), ("black", "yellow"))
+                      if a in components and b in components]
+    predictors = [scipyFft.ifft2(scipyFft.fft2(components[a] * components[b]) * lowpass).real.astype(np.float32)
+                  for a, b in predictorPairs]
+    vectors = [(name, x, y) for name, fundamental in records.items() for x, y in screenHarmonicCentres(fundamental, LATTICE_HARMONICS)]
+    beatCentres = [(ax + sign * bx, ay + sign * by) for i, (nameA, ax, ay) in enumerate(vectors)
+                   for nameB, bx, by in vectors[i + 1:] if nameA != nameB for sign in (1, -1)]
+    beatCentres = [c for c in beatCentres if np.hypot(*c) < 0.5]
+    beatRadius = BEAT_DISK_RADIUS_OF_SCREEN_FREQUENCY * screenFrequency
+    beatProfile = lambda distance, radiusBins: radialCosineWindow(np.clip(distance / radiusBins, 0, 1), BEAT_COSINE_AMPLITUDES) * (distance < radiusBins)
+    beatMask = stampDisks((height, width), beatCentres, beatRadius, beatProfile) if beatCentres else 0
+    lowFrequencyMask = stampDisks((height, width), [(0, 0)], 2 * beatRadius, beatProfile)
+    referenceMask = 1 - np.maximum(beatMask, lowFrequencyMask)
+    bases = [scipyFft.ifft2(spectra[c] * lowpass).real for c in range(3)]
+    references = [scipyFft.ifft2(spectra[c] * lowpass * referenceMask).real for c in range(3)]
+    if not predictors:
+        return np.stack(bases, -1).astype(np.float32)
+    levels = np.clip((0.5 * (references[0] + references[1]) * BRIGHTNESS_LEVEL_COUNT / 255).astype(int), 0, BRIGHTNESS_LEVEL_COUNT - 1)
+    levelCounts = np.bincount(levels.ravel(), minlength=BRIGHTNESS_LEVEL_COUNT)
+    groupOfLevel, group, accumulated = np.zeros(BRIGHTNESS_LEVEL_COUNT, int), 0, 0
+    for level in range(BRIGHTNESS_LEVEL_COUNT):
+        groupOfLevel[level] = group
+        accumulated += levelCounts[level]
+        if accumulated >= MINIMUM_LEVEL_GROUP_PIXEL_FRACTION * levels.size:
+            group, accumulated = group + 1, 0
+    if group > 0 and accumulated:
+        groupOfLevel[groupOfLevel == group] = group - 1
+    groups = groupOfLevel[levels]
+    outputs = []
+    for channel in range(3):
+        residual = tile[..., channel].astype(np.float64) - references[channel]
+        correction = np.zeros_like(residual)
+        for groupIndex in range(groups.max() + 1):
+            selection = groups == groupIndex
+            if selection.sum() < 50:
+                continue
+            matrix = np.stack([p[selection] for p in predictors], 1).astype(np.float64)
+            gram, cross = matrix.T @ matrix, matrix.T @ residual[selection]
+            kept = list(range(len(predictors)))
+            while kept:
+                coefficients = np.linalg.lstsq(gram[np.ix_(kept, kept)], cross[kept], rcond=None)[0]
+                negative = [k for k, c in zip(kept, coefficients) if c <= 0]
+                if not negative:
+                    break
+                kept = [k for k in kept if k not in negative]
+            if kept:
+                full = np.zeros(len(predictors))
+                full[kept] = coefficients
+                correction[selection] = matrix @ full
+        outputs.append(bases[channel] - correction)
+    return np.stack(outputs, -1).astype(np.float32)
+
+
+def descreenArray(rgbArray, screensPerChannel, strength):
+    records = classifyScreensIntoRecords(screensPerChannel)
+    regular = [records[name] for name in ("cyan", "magenta", "black") if name in records]
+    if len(records) < 2 or not regular:
+        return rgbArray
+    screenFrequency = float(np.mean([np.hypot(fx, fy) for fx, fy in regular]))
+    cutoffScale = 1 + STRENGTH_TO_CUTOFF_STEP * (5 - strength)
+    height, width, _ = rgbArray.shape
+    margin, core = REGRESSION_TILE_MARGIN_PIXELS, REGRESSION_TILE_CORE_PIXELS
+    padded = np.pad(rgbArray, ((margin, margin + core), (margin, margin + core), (0, 0)), mode="reflect")
+    output = np.empty_like(rgbArray)
+    for top in range(0, height, core):
+        for left in range(0, width, core):
+            tile = padded[top:top + core + 2 * margin, left:left + core + 2 * margin]
+            processed = descreenTile(tile, records, screenFrequency, cutoffScale)
+            piece = processed[margin:margin + core, margin:margin + core]
+            output[top:top + core, left:left + core] = piece[:height - top, :width - left]
+    return output
 
 
 def descreenWithScreens(image, screensPerChannel, strength, sharpenAmount):
     rgbArray = np.asarray(image.convert("RGB"), dtype=np.float32)
-    for channel, screens in enumerate(screensPerChannel):
-        if screens:
-            rgbArray[..., channel] = removeScreensFromChannel(rgbArray[..., channel], screens, strength)
-            meanFrequency = float(np.mean([np.hypot(fx, fy) for fx, fy, _ in screens]))
-            rgbArray[..., channel] = reduceNoiseInChannel(rgbArray[..., channel], meanFrequency)
+    rgbArray = descreenArray(rgbArray, screensPerChannel, strength)
     result = Image.fromarray(np.clip(rgbArray + 0.5, 0, 255).astype(np.uint8))
     if sharpenAmount > 0:
         result = result.filter(ImageFilter.UnsharpMask(radius=SHARPEN_RADIUS_PIXELS, percent=int(sharpenAmount * 300), threshold=1))
