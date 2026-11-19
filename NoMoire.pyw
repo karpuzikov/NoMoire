@@ -189,6 +189,17 @@ def noiseStrengthAndThreshold(bandName):
     return strength, 255.0 * np.tan((1 - strength) * angle) / np.tan(angle)
 
 
+def totalVariationMap(band):
+    horizontal = np.abs(np.diff(band, axis=1))
+    vertical = np.abs(np.diff(band, axis=0))
+    total = np.zeros_like(band)
+    total[:, :-1] += horizontal
+    total[:, 1:] += horizontal
+    total[:-1, :] += vertical
+    total[1:, :] += vertical
+    return total
+
+
 def reduceNoiseInChannel(channel, screenFrequency):
     pad = NOISE_PADDING_PIXELS
     padded = np.pad(channel.astype(np.float32), ((pad, pad), (pad, pad)), mode="reflect")
@@ -202,7 +213,7 @@ def reduceNoiseInChannel(channel, screenFrequency):
     fineMagnitude = None
     for name, mask in masks.items():
         band = scipyFft.irfft2(spectrum * mask, s=padded.shape)
-        magnitude = np.sqrt(gaussian_filter(band * band, 1.4 / cutoffs[name] / 2.5))
+        magnitude = gaussian_filter(totalVariationMap(band), 1.4 / cutoffs[name] / 2.5)
         if name == "fine":
             fineMagnitude = magnitude
         strength, threshold = noiseStrengthAndThreshold(name)
